@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -e
+
+# Load nvm
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+if [[ -z "$1" ]]; then
+  echo "Usage: ./scripts/wts <branch-name>"
+  exit 1
+fi
+
+branch_name="$1"
+original_dir=$(pwd)
+repo_name=$(basename "$original_dir")
+safe_branch_name="${branch_name//\//-}"
+worktree_path="../${repo_name}-${safe_branch_name}"
+sandbox_image="${repo_name}-claude-sandbox"
+
+# Check if custom sandbox image exists, build if not
+if ! docker image inspect "$sandbox_image" &>/dev/null; then
+  echo "Custom sandbox image not found. Building $sandbox_image..."
+  "$original_dir/scripts/sandbox/build-sandbox"
+fi
+
+env_file="apps/web/.env.local"
+
+# Parse DATABASE_URL from .env.local
+db_url=$(grep -E "^DATABASE_URL=" "$env_file" | cut -d '=' -f2- | tr -d '"')
+
+if [[ -z "$db_url" ]]; then
+  echo "Error: DATABASE_URL not found in $env_file"
+  exit 1
+fi
+
+# Parse: postgresql://user:password@host:port/database
+db_user=$(echo "$db_url" | sed -E 's|postgresql://([^:]+):.*|\1|')
+db_password=$(echo "$db_url" | sed -E 's|postgresql://[^:]+:([^@]+)@.*|\1|')
+db_host=$(echo "$db_url" | sed -E 's|postgresql://[^@]+@([^:]+):.*|\1|')
+source_db_port=$(echo "$db_url" | sed -E 's|postgresql://[^@]+@[^:]+:([0-9]+)/.*|\1|')
+db_name=$(echo "$db_url" | sed -E 's|postgresql://[^/]+/(.+)|\1|')
+
+echo "📊 Parsed database config from $env_file:"
+echo "   Name: $db_name"
+echo "   Host: $db_host"
+echo "   Port: $source_db_port"
+echo "   User: $db_user"
+echo ""
+
+# Calculate unique ports
+# Start at +10 to avoid main repo's test db (typically at +6)
+# Use spacing of 4 ports per worktree (db, db_test, plus buffer)
+worktree_count=$(git worktree list | wc -l)
+new_db_port=$((source_db_port + 10 + (worktree_count * 4)))
+new_db_test_port=$((new_db_port + 2))
+
+compose_project="${repo_name}-${safe_branch_name}"
+
+git fetch origin main
+
+if ! git worktree add -b "$branch_name" "$worktree_path" origin/main; then
+  echo "Failed to create worktree"
+  exit 1
+fi
+
+# Copy .worktreeinclude files
+if [[ -f ".worktreeinclude" ]]; then
+  while IFS= read -r file || [[ -n "$file" ]]; do
+    [[ -z "$file" || "$file" =~ ^# ]] && continue
+    file="${file%/}"
+    if [[ -e "$file" ]]; then
+      mkdir -p "$worktree_path/$(dirname "$file")"
+      cp -r "$file" "$worktree_path/$file"
+      echo "Copied: $file"
+    fi
+  done < ".worktreeinclude"
+fi
+
+# Copy sandbox Claude settings (disables dangerous mode, blocks destructive git commands)
+if [[ -f ".claude/sandbox.settings.local.json" ]]; then
+  mkdir -p "$worktree_path/.claude"
+  cp ".claude/sandbox.settings.local.json" "$worktree_path/.claude/settings.local.json"
+  echo "Copied: sandbox settings -> .claude/settings.local.json"
+fi
+
+# Create worktree-specific docker-compose
+cat > "$worktree_path/docker-compose.yml" << EOF
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    container_name: ${compose_project}-postgres
+    environment:
+      POSTGRES_USER: ${db_user}
+      POSTGRES_PASSWORD: ${db_password}
+      POSTGRES_DB: ${db_name}
+    ports:
+      - '${new_db_port}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${db_user}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-test:
+    image: pgvector/pgvector:pg18
+    container_name: ${compose_project}-postgres-test
+    environment:
+      POSTGRES_USER: ${db_user}
+      POSTGRES_PASSWORD: ${db_password}
+      POSTGRES_DB: ${db_name}_test
+    ports:
+      - '${new_db_test_port}:5432'
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${db_user}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  postgres_test_data:
+EOF
+
+# Update .env.local in worktree with new DATABASE_URL and DATABASE_TEST_URL
+# Using localhost first (for host-based setup: migrations, data copy)
+worktree_env_file="$worktree_path/$env_file"
+worktree_env_test_file="$worktree_path/apps/web/.env.test"
+
+sed -i '' "s|DATABASE_URL=.*|DATABASE_URL=\"postgresql://${db_user}:${db_password}@localhost:${new_db_port}/${db_name}\"|" "$worktree_env_file"
+
+# Add or update DATABASE_TEST_URL
+if grep -q "^DATABASE_TEST_URL=" "$worktree_env_file"; then
+  sed -i '' "s|DATABASE_TEST_URL=.*|DATABASE_TEST_URL=\"postgresql://${db_user}:${db_password}@localhost:${new_db_test_port}/${db_name}_test\"|" "$worktree_env_file"
+else
+  echo "DATABASE_TEST_URL=\"postgresql://${db_user}:${db_password}@localhost:${new_db_test_port}/${db_name}_test\"" >> "$worktree_env_file"
+fi
+
+# Update .env.test with worktree test database URL
+sed -i '' "s|TEST_DATABASE_URL=.*|TEST_DATABASE_URL=postgresql://${db_user}:${db_password}@localhost:${new_db_test_port}/${db_name}_test|" "$worktree_env_test_file"
+
+cd "$worktree_path"
+
+# Ignore local changes to docker-compose.yml and .env.test in this worktree
+git update-index --assume-unchanged docker-compose.yml apps/web/.env.test
+
+echo "📦 Installing dependencies..."
+nvm use
+pnpm i
+
+echo "🚀 Starting worktree database containers..."
+COMPOSE_PROJECT_NAME="$compose_project" docker compose up -d
+
+echo "⏳ Waiting for postgres to be ready..."
+max_attempts=30
+attempt=0
+
+until PGPASSWORD="$db_password" psql -h localhost -p "$new_db_port" -U "$db_user" -d postgres -c '\q' 2>&1; do
+  attempt=$((attempt + 1))
+  if [[ $attempt -ge $max_attempts ]]; then
+    echo "❌ Postgres failed to start after ${max_attempts} seconds"
+    echo "Check logs: COMPOSE_PROJECT_NAME=\"$compose_project\" docker compose logs postgres"
+    exit 1
+  fi
+  echo "   Attempt $attempt/$max_attempts..."
+  sleep 1
+done
+
+echo "✅ Postgres is ready!"
+
+echo "🗄️  Running database migrations..."
+cd apps/web && pnpm db:migrate
+cd ../..
+
+echo "📦 Copying data from source (port ${source_db_port}) to worktree (port ${new_db_port})..."
+
+PGPASSWORD="$db_password" pg_dump \
+  -h "$db_host" \
+  -p "$source_db_port" \
+  -U "$db_user" \
+  -d "$db_name" \
+  --data-only \
+  --disable-triggers \
+  --no-owner \
+  --no-privileges \
+  | PGPASSWORD="$db_password" psql \
+    -h localhost \
+    -p "$new_db_port" \
+    -U "$db_user" \
+    -d "$db_name" \
+    -q
+
+echo "✅ Database cloned successfully!"
+
+git push -u origin "$branch_name"
+
+echo ""
+echo "🎉 Worktree ready!"
+echo "   Path:          $(pwd)"
+echo "   Branch:        $branch_name"
+echo "   DB:            ${db_name} on port ${new_db_port}"
+echo "   Test DB:       ${db_name}_test on port ${new_db_test_port}"
+echo ""
+echo "   DATABASE_URL:      postgresql://${db_user}:${db_password}@localhost:${new_db_port}/${db_name}"
+echo "   DATABASE_TEST_URL: postgresql://${db_user}:${db_password}@localhost:${new_db_test_port}/${db_name}_test"
+echo ""
+
+# Launch iTerm2 with 3-pane layout
+sandbox_name="${compose_project}"
+worktree_dir="$(pwd)"
+
+echo "🐳 Launching iTerm2 with Claude Code sandbox and dev terminals..."
+
+osascript <<EOF
+tell application "iTerm2"
+    create window with default profile
+    tell current window
+        tell current session
+            set name to "Claude Sandbox"
+            write text "cd '$worktree_dir' && docker sandbox run --template '$sandbox_image' --name '$sandbox_name' --mount-docker-socket -v '$HOME/.claude:/home/agent/.claude' -v '$HOME/.claude.json:/home/agent/.claude.json' -w '$worktree_dir' claude"
+
+            -- Split vertically to create right pane
+            set rightPane to (split vertically with default profile)
+            tell rightPane
+                set name to "Dev Terminal"
+                write text "cd '$worktree_dir' && nvm use"
+
+                -- Split horizontally to create bottom-right pane
+                set bottomPane to (split horizontally with default profile)
+                tell bottomPane
+                    set name to "Terminal 2"
+                    write text "cd '$worktree_dir' && nvm use"
+                end tell
+            end tell
+        end tell
+    end tell
+end tell
+EOF
+
+echo "✅ iTerm2 launched with 3-pane layout"

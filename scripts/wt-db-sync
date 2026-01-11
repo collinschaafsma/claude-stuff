@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -e
+
+git_dir=$(git rev-parse --git-dir 2>/dev/null)
+
+if [[ ! "$git_dir" == *".git/worktrees"* ]]; then
+  echo "Error: Not in a git worktree"
+  exit 1
+fi
+
+main_repo=$(git rev-parse --git-common-dir | sed 's/\/.git$//')
+env_file="apps/web/.env.local"
+
+# Parse source DATABASE_URL from main repo
+source_db_url=$(grep -E "^DATABASE_URL=" "$main_repo/$env_file" | cut -d '=' -f2- | tr -d '"')
+
+if [[ -z "$source_db_url" ]]; then
+  echo "Error: DATABASE_URL not found in $main_repo/$env_file"
+  exit 1
+fi
+
+# Parse target DATABASE_URL from current worktree
+target_db_url=$(grep -E "^DATABASE_URL=" "$env_file" | cut -d '=' -f2- | tr -d '"')
+
+if [[ -z "$target_db_url" ]]; then
+  echo "Error: DATABASE_URL not found in $env_file"
+  exit 1
+fi
+
+# Parse source: postgresql://user:password@host:port/database
+source_user=$(echo "$source_db_url" | sed -E 's|postgresql://([^:]+):.*|\1|')
+source_password=$(echo "$source_db_url" | sed -E 's|postgresql://[^:]+:([^@]+)@.*|\1|')
+source_host=$(echo "$source_db_url" | sed -E 's|postgresql://[^@]+@([^:]+):.*|\1|')
+source_port=$(echo "$source_db_url" | sed -E 's|postgresql://[^@]+@[^:]+:([0-9]+)/.*|\1|')
+source_db=$(echo "$source_db_url" | sed -E 's|postgresql://[^/]+/(.+)|\1|')
+
+# Parse target
+target_user=$(echo "$target_db_url" | sed -E 's|postgresql://([^:]+):.*|\1|')
+target_password=$(echo "$target_db_url" | sed -E 's|postgresql://[^:]+:([^@]+)@.*|\1|')
+target_host=$(echo "$target_db_url" | sed -E 's|postgresql://[^@]+@([^:]+):.*|\1|')
+target_port=$(echo "$target_db_url" | sed -E 's|postgresql://[^@]+@[^:]+:([0-9]+)/.*|\1|')
+target_db=$(echo "$target_db_url" | sed -E 's|postgresql://[^/]+/(.+)|\1|')
+
+echo "📦 Database sync"
+echo ""
+echo "   Source: ${source_db} @ ${source_host}:${source_port}"
+echo "   Target: ${target_db} @ ${target_host}:${target_port}"
+echo ""
+read -p "This will overwrite the worktree database. Continue? (y/N) " confirm
+
+if [[ "$confirm" != [yY] ]]; then
+  echo "Aborted"
+  exit 0
+fi
+
+echo ""
+echo "⏳ Syncing database..."
+
+PGPASSWORD="$source_password" pg_dump \
+  -h "$source_host" \
+  -p "$source_port" \
+  -U "$source_user" \
+  -d "$source_db" \
+  --data-only \
+  --disable-triggers \
+  --no-owner \
+  --no-privileges \
+  | PGPASSWORD="$target_password" psql \
+    -h "$target_host" \
+    -p "$target_port" \
+    -U "$target_user" \
+    -d "$target_db" \
+    -q
+
+echo "✅ Database synced successfully!"
