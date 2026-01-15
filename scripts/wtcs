@@ -17,6 +17,7 @@ main_repo=$(git rev-parse --git-common-dir | sed 's/\/.git$//')
 
 echo "This will:"
 echo "  - Stop Docker Sandbox for: $compose_project (if exists)"
+echo "  - Remove sandbox node_modules volumes"
 echo "  - Stop containers and delete volumes for: $compose_project"
 echo "  - Remove worktree at: $worktree_path"
 echo "  - Delete local branch: $branch_name"
@@ -38,6 +39,16 @@ if [[ -n "$sandbox_id" ]]; then
 else
   echo "ℹ️  No Docker Sandbox found with name: $compose_project"
 fi
+
+# Remove sandbox node_modules volumes
+echo "🗑️  Removing sandbox node_modules volumes..."
+docker volume rm "${compose_project}_node_modules" 2>/dev/null || true
+docker volume rm "${compose_project}_web_node_modules" 2>/dev/null || true
+docker volume rm "${compose_project}_ui_node_modules" 2>/dev/null || true
+
+# Clean up node_modules directories (may have root ownership from Docker)
+echo "🧹 Cleaning up node_modules directories..."
+docker run --rm -v "$worktree_path:/workspace" alpine rm -rf /workspace/node_modules /workspace/apps/web/node_modules /workspace/packages/ui/node_modules 2>/dev/null || true
 
 # Stop containers and remove volumes
 COMPOSE_PROJECT_NAME="$compose_project" docker compose down -v

@@ -4,9 +4,10 @@ FROM docker/sandbox-templates:claude-code
 # Setting to empty string effectively unsets it at the image level
 ENV NPM_CONFIG_PREFIX=""
 
-# Set proper terminal type for color support
+# Set proper terminal type and shell for color support and pnpm setup
 # Note: Shift+Enter doesn't work in Docker sandbox - use \ + Enter for newlines
 ENV TERM=xterm-256color
+ENV SHELL=/bin/bash
 
 # Install nvm and Node.js LTS (jod = v22)
 ENV NVM_DIR="/home/agent/.nvm"
@@ -18,12 +19,18 @@ RUN unset NPM_CONFIG_PREFIX \
     && nvm use default
 
 # Enable Corepack and install pnpm
+ENV PNPM_HOME="/home/agent/.local/share/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
 RUN unset NPM_CONFIG_PREFIX \
     && . "$NVM_DIR/nvm.sh" \
     && corepack enable \
-    && corepack prepare pnpm@latest --activate
+    && corepack prepare pnpm@latest --activate \
+    && mkdir -p "$PNPM_HOME"
 
-# Add nvm to shell startup
+# Add nvm and pnpm to shell startup
 RUN echo 'export NVM_DIR="$HOME/.nvm"' >> ~/.bashrc \
     && echo '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"' >> ~/.bashrc \
-    && echo '[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"' >> ~/.bashrc
+    && echo '[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"' >> ~/.bashrc \
+    && echo 'export PNPM_HOME="$HOME/.local/share/pnpm"' >> ~/.bashrc \
+    && echo 'export PATH="$PNPM_HOME:$PATH"' >> ~/.bashrc
+
